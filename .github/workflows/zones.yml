@@ -1,0 +1,95 @@
+name: Régions hors ligne
+
+on:
+  schedule:
+    - cron: "0 2 3 * *"   # le 3 de chaque mois
+  workflow_dispatch:
+    inputs:
+      zones:
+        description: "Zones à préparer, séparées par des virgules (vide = toutes)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zones
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  liste:
+    runs-on: ubuntu-latest
+    outputs:
+      zones: ${{ steps.l.outputs.zones }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: l
+        env:
+          CHOIX: ${{ inputs.zones }}
+        run: |
+          if [ -n "$CHOIX" ]; then
+            Z=$(jq -c --arg c "$CHOIX" '($c | split(",") | map(gsub(" "; ""))) as $c | [.zones[].id | select(. as $i | $c | index($i))]' zones.json)
+          else
+            Z=$(jq -c '[.zones[].id]' zones.json)
+          fi
+          echo "zones=$Z" >> "$GITHUB_OUTPUT"
+          echo "$Z"
+          gh release view zones >/dev/null 2>&1 || gh release create zones --title "Régions hors ligne" \
+            --notes "Données © les contributeurs d'OpenStreetMap, licence ODbL. Préparées chaque mois pour GB Navigation."
+
+  zone:
+    needs: liste
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        id: ${{ fromJson(needs.liste.outputs.zones) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Faire de la place
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker image prune -af >/dev/null
+          df -h .
+      - name: Outils
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool jq >/dev/null
+          python3 -m pip install -q osmium
+          docker pull -q ghcr.io/valhalla/valhalla:3.9.0
+      - name: Préparer ${{ matrix.id }}
+        run: outils/construire.sh "${{ matrix.id }}"
+      - name: Publier
+        run: |
+          for f in sortie/*; do
+            for essai in 1 2 3 4; do gh release upload zones "$f" --clobber && break || sleep $((essai * 15)); done
+          done
+
+  catalogue:
+    needs: zone
+    if: always() && needs.zone.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Catalogue
+        run: |
+          mkdir -p desc
+          gh release view zones --json assets -q '.assets[].name' > actifs.txt
+          for id in $(jq -r '.zones[].id' zones.json); do
+            if grep -qx "$id.json" actifs.txt; then gh release download zones -p "$id.json" -D desc --clobber; fi
+          done
+          python3 outils/catalogue.py zones.json desc catalogue.json
+          gh release upload zones catalogue.json --clobber
+      - name: Retirer les anciennes versions
+        run: |
+          jq -r '.zones[].fichiers[] | .nom, (.parties[]?.nom)' catalogue.json | sort -u > gardes.txt
+          while read -r a; do
+            case "$a" in *.json) continue;; esac
+            grep -qx "$a" gardes.txt || gh release delete-asset zones "$a" -y
+          done < actifs.txt
